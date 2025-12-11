@@ -11,16 +11,18 @@ const CHANNEL_WHITELIST = [
   '1403013451118280878', // gas-station
 ];
 
-const BORDER_CONTROL_ID   = process.env.BORDER_CONTROL_CHANNEL_ID;
-const DEALER_ROLE_ID      = process.env.DEALER_ROLE_ID;
-const JUNKIE_ROLE_ID      = process.env.JUNKIE_ROLE_ID;
-const CHURCH_PASS_ROLE_ID = process.env.CHURCH_PASS_ROLE_ID;
+const BORDER_CONTROL_ID     = process.env.BORDER_CONTROL_CHANNEL_ID;
+const DEALER_ROLE_ID        = process.env.DEALER_ROLE_ID;
+const JUNKIE_ROLE_ID        = process.env.JUNKIE_ROLE_ID;
+const CHURCH_PASS_ROLE_ID   = process.env.CHURCH_PASS_ROLE_ID;
+const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 
 const JUNKIE_TARGET = 50;  // reactions
 const DEALER_TARGET = 50;  // media posts
 
 const REACTION_COOLDOWN_MS = 60_000;
 const POST_COOLDOWN_MS     = 30_000;
+const LEADERBOARD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 const client = new Client({
   intents: [
@@ -42,6 +44,12 @@ const counterSchema = new mongoose.Schema({
 });
 const Counter = mongoose.model('Counter', counterSchema);
 
+const metadataSchema = new mongoose.Schema({
+  key:   { type: String, unique: true, index: true },
+  value: { type: mongoose.Schema.Types.Mixed }
+});
+const Metadata = mongoose.model('Metadata', metadataSchema);
+
 async function addCount(userId, field) {
   const updated = await Counter.findOneAndUpdate(
     { userId }, { $inc: { [field]: 1 } }, { new: true, upsert: true }
@@ -52,6 +60,44 @@ async function addCount(userId, field) {
 const reactSeen = new Map(); // `${userId}:${messageId}`
 const postSeen  = new Map(); // `${userId}` last time
 const inCountableChannel = id => CHANNEL_WHITELIST.includes(id);
+
+async function getMetadata(key) {
+  const row = await Metadata.findOne({ key }).lean();
+  return row?.value;
+}
+
+async function setMetadata(key, value) {
+  await Metadata.findOneAndUpdate({ key }, { value }, { upsert: true });
+}
+
+async function topCounters(field, limit = 5) {
+  const rows = await Counter.find().sort({ [field]: -1 }).limit(limit).lean();
+  return rows.map((row, idx) => `${idx + 1}. <@${row.userId}> — **${row[field]}**`);
+}
+
+async function postLeaderboard(guild) {
+  if (!LEADERBOARD_CHANNEL_ID) return false;
+  const channel = guild.channels.cache.get(LEADERBOARD_CHANNEL_ID);
+  if (!channel || !channel.isTextBased()) return false;
+
+  const [topReacts, topPosts] = await Promise.all([
+    topCounters('junkieReacts'),
+    topCounters('dealerPosts')
+  ]);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 Addict City Leaderboards')
+    .setDescription('Latest tallies for reactions and media posts.')
+    .addFields(
+      { name: 'Reactions', value: topReacts.length ? topReacts.join('\n') : 'No reactions tracked yet.' },
+      { name: 'Media Posts', value: topPosts.length ? topPosts.join('\n') : 'No media posts tracked yet.' }
+    )
+    .setColor(0xffc107)
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+  return true;
+}
 
 async function announceVisaUpgrade(member, which, total) {
   const ch = member.guild.channels.cache.get(BORDER_CONTROL_ID);
@@ -131,5 +177,20 @@ client.on('messageCreate', async (msg) => {
   }
 });
 
-client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
+const LEADERBOARD_STATE_KEY = 'leaderboard:lastPostedAt';
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  const guild = client.guilds.cache.first();
+  if (!guild) return;
+
+  const lastPostedAt = await getMetadata(LEADERBOARD_STATE_KEY);
+  const now = Date.now();
+  if (lastPostedAt && now - lastPostedAt < LEADERBOARD_COOLDOWN_MS) return;
+
+  const posted = await postLeaderboard(guild).catch(() => false);
+  if (posted) {
+    await setMetadata(LEADERBOARD_STATE_KEY, now);
+  }
+});
 client.login(process.env.DISCORD_TOKEN);
